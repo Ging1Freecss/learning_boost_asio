@@ -1,0 +1,70 @@
+# ==========================================
+# Build Artifacts & Binaries
+# ==========================================
+build/
+build*/
+bin/
+out/
+dist/
+
+# Compiled Object Files & Libraries
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+# ==========================================
+# CMake Generated Files
+# ==========================================
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
+compile_commands.json
+
+# ==========================================
+# Language Server / Tooling Cache
+# ==========================================
+# Clangd indexing cache
+.cache/
+
+# ==========================================
+# Package Manager (vcpkg)
+# ==========================================
+vcpkg_installed/
+
+# ==========================================
+# IDE & Editor Configurations
+# ==========================================
+# VS Code (ignore user/workspace state, allow shared configs)
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# JetBrains / CLion
+.idea/
+cmake-build-*/
+
+# Visual Studio
+.vs/
+
+# ==========================================
+# OS & Temporary / Editor Swap Files
+# ==========================================
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+*.log
+*.tmp
