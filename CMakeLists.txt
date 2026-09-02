@@ -17,6 +17,7 @@ add_executable(${PROJECT_NAME}
   src/basic_boost.cpp
   include/coroutine_boost.hpp
   src/coroutine_boost.cpp
+  include/proxy_boost.hpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/include)

@@ -156,7 +156,8 @@ class tcp_server {
 public:
   tcp_server(boost::asio::io_context &io, unsigned short port = 1313)
       : io_{io}, acceptor_(io, tcp::endpoint(tcp::v4(), port)) {
-    std::cout << "[tcp_server] Listening on port " << port << "..." << std::endl;
+    std::cout << "[tcp_server] Listening on port " << port << "..."
+              << std::endl;
     start_accept();
   }
 
@@ -227,7 +228,8 @@ private:
                 << " bytes) from: " << remote_endpoint_ << std::endl;
 
       auto message = std::make_shared<std::string>(make_daytime_string());
-      // Copy endpoint locally to prevent data race with subsequent receive operations
+      // Copy endpoint locally to prevent data race with subsequent receive
+      // operations
       udp::endpoint target_endpoint = remote_endpoint_;
 
       socket_.async_send_to(
