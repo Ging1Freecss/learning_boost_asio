@@ -19,6 +19,7 @@ add_executable(${PROJECT_NAME}
   src/coroutine_boost.cpp
   include/proxy_boost.hpp
   include/echo_server.hpp
+  include/chat_server.hpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/include)
