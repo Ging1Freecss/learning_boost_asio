@@ -1,6 +1,9 @@
 #pragma once
 
+#include <boost/asio/as_tuple.hpp>
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/error.hpp>
+#include <boost/system/detail/error_code.hpp>
 #include <boost/system/error_code.hpp>
 
 #include <chrono>
@@ -93,10 +96,7 @@ class chat_session : public chat_participant,
 public:
   chat_session(tcp::socket socket, std::shared_ptr<chat_room> room)
       : socket_{std::move(socket)}, room_(std::move(room)),
-        timer_(socket_.get_executor()),
-        write_channel_(socket_.get_executor(), 100) {
-    timer_.expires_at(std::chrono::steady_clock::time_point::max());
-  }
+        write_channel_(socket_.get_executor(), max_write_msgs) {}
 
   void start() {
     room_->join(shared_from_this());
@@ -113,15 +113,15 @@ public:
   }
 
   void deliver(const std::string &msg) {
-    if (write_msgs_.size() >= max_write_msgs) {
-      write_msgs_.pop_front();
+    if (stopped_)
+      return;
+    if (!write_channel_.try_send(boost::system::error_code{}, msg)) {
+      // channel is full , evict the last one
+      write_channel_.try_receive([](auto...) {});
+
+      // push the latest msg
+      write_channel_.try_send(boost::system::error_code{}, msg);
     }
-    write_msgs_.push_back(msg);
-    /*
-        if writer() is sleeping , this wakes it up
-        if writer() is already busy transmitting , this is safe no-op
-    */
-    (void)timer_.cancel_one();
   }
 
 private:
@@ -130,7 +130,7 @@ private:
       std::string read_msg{};
       while (true) {
         std::size_t n = co_await boost::asio::async_read_until(
-            socket_, boost::asio::dynamic_buffer(read_msg), "\n",
+            socket_, boost::asio::dynamic_buffer(read_msg, max_msg_bytes), "\n",
             boost::asio::use_awaitable);
 
         room_->deliver(read_msg.substr(0, n));
@@ -144,25 +144,21 @@ private:
   auto writer() -> boost::asio::awaitable<void> {
     try {
       while (socket_.is_open()) {
-        if (write_msgs_.empty()) {
-          /*
-              case A: no message to send, put coroutine to sleep
-              we wait on timer_ which is set to eternity
-              redirect_error captures 'operation_aborted' when
-              timer.cancel_one() is called preventing c++ exception from being
-             thrown
-          */
-          boost::system::error_code ec;
-          co_await timer_.async_wait(
-              boost::asio::redirect_error(boost::asio::use_awaitable, ec));
-        } else {
-          co_await boost::asio::async_write(
-              socket_, boost::asio::buffer(write_msgs_.front()),
-              boost::asio::use_awaitable);
 
-          write_msgs_.pop_front();
+        auto [e, msg] = co_await write_channel_.async_receive(
+            boost::asio::as_tuple(boost::asio::use_awaitable));
+
+        if (e == boost::asio::experimental::error::channel_closed) {
+          break;
         }
+        // 2. Unexpected error: throw it so the catch block handles it
+        if (e) {
+          throw boost::system::system_error(e);
+        }
+        co_await boost::asio::async_write(socket_, boost::asio::buffer(msg),
+                                          boost::asio::use_awaitable);
       }
+
     } catch (const std::exception &) {
       stop();
     }
@@ -175,27 +171,32 @@ private:
     stopped_ = true;
     room_->leave(shared_from_this());
     boost::system::error_code ec;
+    write_channel_.close();
     auto close_ec = socket_.close(ec);
     (void)close_ec;
-    auto cancelled = timer_.cancel();
-    (void)cancelled;
   }
 
   constexpr static std::size_t max_write_msgs{100};
+  constexpr static std::size_t max_msg_bytes{4096};
   tcp::socket socket_;
   std::shared_ptr<chat_room> room_;
-  boost::asio::steady_timer timer_;
-  std::deque<std::string> write_msgs_;
-  boost::asio::experimental::channel<void(std::string)> write_channel_;
+  boost::asio::experimental::channel<void(boost::system::error_code,
+                                          std::string)>
+      write_channel_;
   bool stopped_{false};
 };
 
 auto listener(tcp::acceptor acceptor_, std::shared_ptr<chat_room> room)
     -> boost::asio::awaitable<void> {
-  while (true) {
+  while (acceptor_.is_open()) {
     try {
       auto socket = co_await acceptor_.async_accept(boost::asio::use_awaitable);
       std::make_shared<chat_session>(std::move(socket), room)->start();
+    } catch (const boost::system::system_error &e) {
+      if (e.code() == boost::asio::error::operation_aborted) {
+        break;
+      }
+      std::cerr << "Listener accept error: " << e.what() << "\n";
     } catch (const std::exception &e) {
       std::cerr << "Listener accept error: " << e.what() << "\n";
     }
