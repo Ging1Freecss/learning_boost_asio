@@ -20,6 +20,8 @@ add_executable(${PROJECT_NAME}
   include/proxy_boost.hpp
   include/echo_server.hpp
   include/chat_server.hpp
+  include/timeout_watchdog.hpp
+  include/completion_executor.hpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/include)
