@@ -22,6 +22,7 @@ add_executable(${PROJECT_NAME}
   include/chat_server.hpp
   include/timeout_watchdog.hpp
   include/completion_executor.hpp
+  include/compose.hpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/include)

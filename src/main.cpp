@@ -1,12 +1,12 @@
-#include "completion_executor.hpp"
-#include <boost/asio/io_context.hpp>
+#include "compose.hpp"
 #include <exception>
 #include <iostream>
 
 int main() {
   try {
-    boost::asio::io_context io;
-    return completion_executor::start_completion_executor(io);
+    std::cout << "Starting compose demo on port 55555...\n";
+    compose::start_compose();
+    return 0;
   } catch (const std::exception &e) {
     std::cerr << "Exception: " << e.what() << "\n";
     return 1;

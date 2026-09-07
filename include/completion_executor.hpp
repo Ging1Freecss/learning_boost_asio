@@ -78,6 +78,7 @@ int start_completion_executor(boost::asio::io_context &io_context) {
       }));
   tcp::socket client_socket(io_context);
   client_socket.connect(acceptor.local_endpoint());
+
   boost::asio::steady_timer timer(io_context);
   timer.expires_at(boost::asio::steady_timer::clock_type::time_point::min());
 
