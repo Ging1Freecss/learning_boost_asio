@@ -8,6 +8,7 @@
 #include <boost/asio/deferred.hpp>
 // Provides `boost::asio::io_context`, the core I/O execution context / event
 // loop that dispatches completion handlers.
+#include <boost/asio/error.hpp>
 #include <boost/asio/io_context.hpp>
 // Provides TCP networking primitives: `tcp::socket`, `tcp::acceptor`, and
 // `tcp::endpoint`.
@@ -33,7 +34,26 @@
 
 namespace compose {
 using boost::asio::ip::tcp;
+/*
+  1. Caller creates handler bound to strand:
+   h = bind_executor(my_strand, my_callback);
 
+2. async_write_message creates intermediate_completion_handler:
+   struct intermediate_completion_handler {
+       handler_ = h;
+       get_executor() -> queries h -> returns my_strand
+       get_allocator() -> queries h -> returns default or custom allocator
+   };
+
+3. boost::asio::async_write begins:
+   async_write inspects intermediate_completion_handler
+   └──> "Do you have an executor?" -> Yes, get_executor() returns my_strand!
+
+4. I/O completes:
+   async_write dispatches intermediate_completion_handler::operator() ON
+my_strand. operator() frees the string buffer, then calls handler_(ec) ON
+my_strand.
+*/
 /*
   it call async_write but let user use void(boost::system::error_code) instead
   of void(boost::system::error_code, std::size_t)
@@ -72,18 +92,30 @@ auto async_write_message(tcp::socket &socket, const char *message,
         auto executor = boost::asio::get_associated_executor(
             completion_handler, socket_ref.get_executor());
 
-        /*
-          internal of std::bind it take a variadic template and match parameter
-          position through std::placeholders , if that position arg is passed it
-          is used and rest are disgarded
-        */
-        auto adapted_handler = std::bind(
-            std::forward<decltype(completion_handler)>(completion_handler),
-            std::placeholders::_1);
+        std::size_t length = (msg != nullptr) ? std::strlen(msg) : 0;
 
-        boost::asio::async_write(
-            socket_ref, boost::asio::buffer(msg, std::strlen(msg)),
-            boost::asio::bind_executor(executor, std::move(adapted_handler)));
+        /*
+          if msg is empty, we must reject it.
+          An async operation must not invoke the completion handler
+          synchronously inside the initiation function. Doing so can cause
+          re-entrancy bugs,unexpected lock orders or stack overflows
+        */
+
+        if (length == 0) {
+          boost::asio::post(boost::asio::bind_executor(
+              executor, std::bind(std::forward<decltype(completion_handler)>(
+                                      completion_handler),
+                                  boost::asio::error::invalid_argument)));
+        } else {
+
+          auto adapted_handler = std::bind(
+              std::forward<decltype(completion_handler)>(completion_handler),
+              std::placeholders::_1);
+
+          boost::asio::async_write(
+              socket_ref, boost::asio::buffer(msg, length),
+              boost::asio::bind_executor(executor, std::move(adapted_handler)));
+        }
       };
 
   /*
@@ -102,62 +134,92 @@ auto async_write_message(tcp::socket &socket, const char *message,
 }
 
 void test_callback() {
+  std::cout << "\n--- Running test_callback ---\n";
   boost::asio::io_context io_context;
   tcp::acceptor acceptor(io_context, {tcp::v4(), 55555});
-  tcp::socket socket = acceptor.accept();
-
-  async_write_message(socket, "Testing callback\r\n",
+  acceptor.set_option(tcp::acceptor::reuse_address(true));
+  // Connect locally to establish a real socket connection for testing
+  tcp::socket server_socket(io_context);
+  tcp::socket client_socket(io_context);
+  client_socket.connect(acceptor.local_endpoint());
+  acceptor.accept(server_socket);
+  // Testing normal message
+  async_write_message(server_socket, "Hello Callback\r\n",
                       [](const boost::system::error_code &error) {
                         if (!error) {
-                          std::cout << "[Callback] "
-                                    << " bytes transferred successfully.\n";
+                          std::cout
+                              << "[Callback] Message sent successfully.\n";
                         } else {
                           std::cout << "[Callback] Error: " << error.message()
                                     << "\n";
                         }
                       });
-
+  // Testing empty message (should trigger invalid_argument asynchronously)
+  async_write_message(
+      server_socket, "", [](const boost::system::error_code &error) {
+        if (!error) {
+          std::cout << "[Callback] Message sent successfully.\n";
+        } else {
+          std::cout << "[Callback] (Expected) Empty message error: "
+                    << error.message() << "\n";
+        }
+      });
   io_context.run();
 }
 
-void test_deferred() {
+inline void test_deferred() {
+  std::cout << "\n--- Running test_deferred ---\n";
   boost::asio::io_context io_context;
-
   tcp::acceptor acceptor(io_context, {tcp::v4(), 55555});
-  tcp::socket socket = acceptor.accept();
-
+  acceptor.set_option(tcp::acceptor::reuse_address(true));
+  tcp::socket server_socket(io_context);
+  tcp::socket client_socket(io_context);
+  client_socket.connect(acceptor.local_endpoint());
+  acceptor.accept(server_socket);
+  // Package the operation lazily using boost::asio::deferred
   boost::asio::async_operation auto op = async_write_message(
-      socket, "Testing deferred\r\n", boost::asio::deferred);
-  // Later, we trigger initiation by invoking `op` with our completion handler:
+      server_socket, "Hello Deferred\r\n", boost::asio::deferred);
+  std::cout << "[Deferred] Operation packaged, launching now...\n";
+  // Actually launch the operation by supplying the completion callback
   std::move(op)([](const boost::system::error_code &error) {
     if (!error) {
-      std::cout << "[Deferred] " << " bytes transferred successfully.\n";
+      std::cout << "[Deferred] Message sent successfully.\n";
     } else {
       std::cout << "[Deferred] Error: " << error.message() << "\n";
     }
   });
-
   io_context.run();
 }
 
-void test_future() {
-
+inline void test_future() {
+  std::cout << "\n--- Running test_future ---\n";
   boost::asio::io_context io_context;
   tcp::acceptor acceptor(io_context, {tcp::v4(), 55555});
-  tcp::socket socket = acceptor.accept();
-  std::future<void> f = async_write_message(socket, "Testing future\r\n",
-                                            boost::asio::use_future);
+  acceptor.set_option(tcp::acceptor::reuse_address(true));
+  tcp::socket server_socket(io_context);
+  tcp::socket client_socket(io_context);
+  client_socket.connect(acceptor.local_endpoint());
+  acceptor.accept(server_socket);
+  // Test successful write with future
+  std::future<void> f_success = async_write_message(
+      server_socket, "Hello Future\r\n", boost::asio::use_future);
+  // Test error write with future (empty message triggers invalid_argument)
+  std::future<void> f_error =
+      async_write_message(server_socket, "", boost::asio::use_future);
   io_context.run();
+  // Verify successful future
   try {
-    // Retrieve the result. Because `io_context.run()` already finished all
-    // work, the value is already available and `f.get()` returns immediately
-    // without blocking.
-
-    std::cout << " bytes transferred\n";
+    f_success.get(); // Blocks if not ready, returns void on success
+    std::cout << "[Future] Success future resolved cleanly.\n";
   } catch (const std::exception &e) {
-    // If the socket was closed or an OS error occurred during the write,
-    // it arrives here as a `boost::system::system_error`.
-    std::cout << "Error: " << e.what() << "\n";
+    std::cout << "[Future] Unexpected exception: " << e.what() << "\n";
+  }
+  // Verify error future throws as expected
+  try {
+    f_error.get(); // Should throw boost::system::system_error
+    std::cout << "[Future] Unexpected: error future succeeded.\n";
+  } catch (const std::exception &e) {
+    std::cout << "[Future] (Expected) Exception caught: " << e.what() << "\n";
   }
 }
 
