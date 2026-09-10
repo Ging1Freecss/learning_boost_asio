@@ -1,8 +1,11 @@
 
 // Provides `boost::asio::deferred`, a completion token used for lazy/deferred
 // initiation of asynchronous operations.
+#include "basic_boost.hpp"
+#include <boost/asio/associated_allocator.hpp>
 #include <boost/asio/associated_executor.hpp>
 #include <boost/asio/async_result.hpp>
+#include <boost/asio/bind_allocator.hpp>
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/deferred.hpp>
@@ -15,6 +18,7 @@
 #include <boost/asio/ip/tcp.hpp>
 // Provides `boost::asio::use_future`, a completion token that transforms the
 // asynchronous operation into a `std::future`.
+#include <boost/asio/post.hpp>
 #include <boost/asio/use_future.hpp>
 // Provides `boost::asio::async_write`, a high-level composite operation that
 // guarantees the entire buffer is written unless an error occurs (unlike
@@ -28,6 +32,9 @@
 #include <functional>
 #include <future>
 #include <iostream>
+#include <memory>
+#include <ostream>
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -58,12 +65,17 @@ my_strand.
   it call async_write but let user use void(boost::system::error_code) instead
   of void(boost::system::error_code, std::size_t)
 */
-template <typename CompletionToken>
+template <typename T, typename CompletionToken>
   requires boost::asio::completion_token_for<CompletionToken,
-                                             void(boost::system::error_code)>
-auto async_write_message(tcp::socket &socket, const char *message,
+                                             void(boost::system::error_code)> &&
+           requires(std::ostream &os, const T &value) { os << value; }
+auto async_write_message(tcp::socket &socket, const T &message,
                          CompletionToken &&token) {
 
+  // buffer
+  std::ostringstream os;
+  os << message;
+  auto encoded_message = std::make_unique<std::string>(os.str());
   /*
     the initiation function object is responsible for actually launching the
     underlying asynchronous operation
@@ -77,7 +89,7 @@ auto async_write_message(tcp::socket &socket, const char *message,
   auto initiation =
       [](boost::asio::completion_handler_for<void(
              boost::system::error_code)> auto &&completion_handler,
-         tcp::socket &socket_ref, const char *msg) {
+         tcp::socket &socket_ref, std::unique_ptr<std::string> msg) {
         /*
           every completion handler can have a executor associated with it,
           -if we wrap completion_handler inside std::bind , the resulting
@@ -92,30 +104,67 @@ auto async_write_message(tcp::socket &socket, const char *message,
         auto executor = boost::asio::get_associated_executor(
             completion_handler, socket_ref.get_executor());
 
-        std::size_t length = (msg != nullptr) ? std::strlen(msg) : 0;
+        auto allocator = boost::asio::get_associated_allocator(
+            completion_handler, std::allocator<void>{});
 
-        /*
-          if msg is empty, we must reject it.
-          An async operation must not invoke the completion handler
-          synchronously inside the initiation function. Doing so can cause
-          re-entrancy bugs,unexpected lock orders or stack overflows
-        */
+        if (msg->empty()) {
+          // post the error asynchronously
 
-        if (length == 0) {
-          boost::asio::post(boost::asio::bind_executor(
-              executor, std::bind(std::forward<decltype(completion_handler)>(
-                                      completion_handler),
-                                  boost::asio::error::invalid_argument)));
-        } else {
+          boost::asio::post(boost::asio::bind_allocator(
+              allocator,
+              boost::asio::bind_executor(
+                  executor, [h = std::forward<decltype(completion_handler)>(
+                                 completion_handler)]() mutable {
+                    h(boost::asio::error::invalid_argument);
+                  })));
 
-          auto adapted_handler = std::bind(
-              std::forward<decltype(completion_handler)>(completion_handler),
-              std::placeholders::_1);
-
-          boost::asio::async_write(
-              socket_ref, boost::asio::buffer(msg, length),
-              boost::asio::bind_executor(executor, std::move(adapted_handler)));
+          return;
         }
+        /*
+          Intermediate completion handler
+          ------------------------------------
+          use for underlying `boost::asio::async_write` expects a completion
+       signature of: void(boost::system::error_code, std::size_t
+       bytes_transferred)
+        */
+        using Handler = std::decay_t<decltype(completion_handler)>;
+        struct intermediate_completion_handler {
+          tcp::socket &socket_;
+          std::unique_ptr<std::string> msg_;
+          Handler handler_;
+
+          void operator()(const boost::system::error_code &error, std::size_t) {
+            msg_.reset();
+            handler_(error);
+          }
+
+          // check for custom executor
+          using executor_type = boost::asio::associated_executor_t<
+              typename std::decay_t<decltype(completion_handler)>,
+              tcp::socket::executor_type>;
+
+          auto get_executor() const noexcept -> executor_type {
+            return boost::asio::get_associated_executor(handler_,
+                                                        socket_.get_executor());
+          }
+
+          // check for custom allocator
+          using allocator_type = boost::asio::associated_allocator_t<
+              typename std::decay_t<decltype(completion_handler)>,
+              std::allocator<void>>;
+
+          auto get_allocator() const noexcept -> allocator_type {
+            return boost::asio::get_associated_allocator(
+                handler_, std::allocator<void>{});
+          }
+        };
+
+        auto buffer_view = boost::asio::buffer(*msg);
+        boost::asio::async_write(socket_ref, buffer_view,
+                                 intermediate_completion_handler{
+                                     socket_ref, std::move(msg),
+                                     std::forward<decltype(completion_handler)>(
+                                         completion_handler)});
       };
 
   /*
@@ -130,45 +179,43 @@ auto async_write_message(tcp::socket &socket, const char *message,
   */
   return boost::asio::async_initiate<CompletionToken,
                                      void(boost::system::error_code)>(
-      initiation, token, std::ref(socket), message);
+      initiation, token, std::ref(socket), std::move(encoded_message));
 }
 
-void test_callback() {
-  std::cout << "\n--- Running test_callback ---\n";
+//------------------------------------------------------------------------------
+// Test 1: Standard Callback Token (Lambda)
+//------------------------------------------------------------------------------
+inline void test_callback() {
+  std::cout << "\n=== Running test_callback ===\n";
   boost::asio::io_context io_context;
   tcp::acceptor acceptor(io_context, {tcp::v4(), 55555});
   acceptor.set_option(tcp::acceptor::reuse_address(true));
-  // Connect locally to establish a real socket connection for testing
   tcp::socket server_socket(io_context);
   tcp::socket client_socket(io_context);
   client_socket.connect(acceptor.local_endpoint());
   acceptor.accept(server_socket);
-  // Testing normal message
-  async_write_message(server_socket, "Hello Callback\r\n",
-                      [](const boost::system::error_code &error) {
-                        if (!error) {
-                          std::cout
-                              << "[Callback] Message sent successfully.\n";
-                        } else {
-                          std::cout << "[Callback] Error: " << error.message()
-                                    << "\n";
-                        }
-                      });
-  // Testing empty message (should trigger invalid_argument asynchronously)
+  // 1. Success case: passing a number (generic type T)
+  async_write_message(
+      server_socket, 123456, [](const boost::system::error_code &error) {
+        if (!error)
+          std::cout << "[Callback] Number sent successfully.\n";
+        else
+          std::cout << "[Callback] Error: " << error.message() << "\n";
+      });
+  // 2. Error case: empty message triggers asynchronous invalid_argument
   async_write_message(
       server_socket, "", [](const boost::system::error_code &error) {
-        if (!error) {
-          std::cout << "[Callback] Message sent successfully.\n";
-        } else {
+        if (!error)
+          std::cout << "[Callback] Unexpected: empty message sent.\n";
+        else
           std::cout << "[Callback] (Expected) Empty message error: "
                     << error.message() << "\n";
-        }
       });
   io_context.run();
 }
 
 inline void test_deferred() {
-  std::cout << "\n--- Running test_deferred ---\n";
+  std::cout << "\n=== Running test_deferred ===\n";
   boost::asio::io_context io_context;
   tcp::acceptor acceptor(io_context, {tcp::v4(), 55555});
   acceptor.set_option(tcp::acceptor::reuse_address(true));
@@ -176,23 +223,23 @@ inline void test_deferred() {
   tcp::socket client_socket(io_context);
   client_socket.connect(acceptor.local_endpoint());
   acceptor.accept(server_socket);
-  // Package the operation lazily using boost::asio::deferred
-  boost::asio::async_operation auto op = async_write_message(
-      server_socket, "Hello Deferred\r\n", boost::asio::deferred);
-  std::cout << "[Deferred] Operation packaged, launching now...\n";
-  // Actually launch the operation by supplying the completion callback
+  // Packaging the operation lazily: does NOT commence yet!
+  boost::asio::async_operation auto op =
+      async_write_message(server_socket, std::string("Deferred payload\r\n"),
+                          boost::asio::deferred);
+  std::cout << "[Deferred] Operation packaged. Launching now...\n";
+  // Commencing the operation by supplying the callback
   std::move(op)([](const boost::system::error_code &error) {
-    if (!error) {
+    if (!error)
       std::cout << "[Deferred] Message sent successfully.\n";
-    } else {
+    else
       std::cout << "[Deferred] Error: " << error.message() << "\n";
-    }
   });
   io_context.run();
 }
 
 inline void test_future() {
-  std::cout << "\n--- Running test_future ---\n";
+  std::cout << "\n=== Running test_future ===\n";
   boost::asio::io_context io_context;
   tcp::acceptor acceptor(io_context, {tcp::v4(), 55555});
   acceptor.set_option(tcp::acceptor::reuse_address(true));
@@ -200,23 +247,22 @@ inline void test_future() {
   tcp::socket client_socket(io_context);
   client_socket.connect(acceptor.local_endpoint());
   acceptor.accept(server_socket);
-  // Test successful write with future
-  std::future<void> f_success = async_write_message(
-      server_socket, "Hello Future\r\n", boost::asio::use_future);
-  // Test error write with future (empty message triggers invalid_argument)
+  // Launching operations returning std::future<void>
+  std::future<void> f_success =
+      async_write_message(server_socket, 987.654, boost::asio::use_future);
   std::future<void> f_error =
       async_write_message(server_socket, "", boost::asio::use_future);
   io_context.run();
-  // Verify successful future
+  // Verify success future
   try {
-    f_success.get(); // Blocks if not ready, returns void on success
+    f_success.get();
     std::cout << "[Future] Success future resolved cleanly.\n";
   } catch (const std::exception &e) {
     std::cout << "[Future] Unexpected exception: " << e.what() << "\n";
   }
-  // Verify error future throws as expected
+  // Verify error future throws boost::system::system_error
   try {
-    f_error.get(); // Should throw boost::system::system_error
+    f_error.get();
     std::cout << "[Future] Unexpected: error future succeeded.\n";
   } catch (const std::exception &e) {
     std::cout << "[Future] (Expected) Exception caught: " << e.what() << "\n";
